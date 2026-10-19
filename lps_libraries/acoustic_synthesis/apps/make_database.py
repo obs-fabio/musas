@@ -1,0 +1,252 @@
+"""Make a new database
+"""
+import os
+import argparse
+import tqdm
+
+import lps_utils.quantities as lps_qty
+import lps_utils.utils as lps_utils
+import lps_sp.acoustical.debugger as lps_sp_debug
+import lps_ml.datasets as ml_db
+import lps_synthesis.scenario.sonar as lps_sonar
+import lps_synthesis.database as syndb
+
+import memory_profiler
+
+def _main():
+    parser = argparse.ArgumentParser(
+        description="Synthetic database generator for underwater acoustic scenarios."
+    )
+
+    parser.add_argument(
+        "--n_samples",
+        type=int,
+        default=250,
+        help="Select the number of samples in dataset. (default: 250)",
+    )
+    parser.add_argument(
+        "--n-fixed-scenarios",
+        type=int,
+        default=2,
+        help="Number of fixed-distance scenarios per condition (default: 2)",
+    )
+
+    parser.add_argument(
+        "--n-random-scenarios",
+        type=int,
+        default=2,
+        help="Number of random scenarios per condition (default: 2)",
+    )
+
+    parser.add_argument(
+        "--only_fixed_dynamics",
+        action="store_true",
+        help="Only include fixed-distance dynamics in the dataset (default: False)",
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Set seed. (default: 42)",
+    )
+
+    parser.add_argument(
+        "--only-info",
+        action="store_true",
+        help="Only print database info",
+    )
+
+    parser.add_argument(
+        "--only-plot",
+        action="store_true",
+        help="Only plot sample dynamics",
+    )
+
+    parser.add_argument(
+        "--sensitivity",
+        type=float,
+        default=-180.0,
+        help="Hydrophone sensitivity in dB re V/μPa (default: -180)",
+    )
+
+    parser.add_argument(
+        "--gain",
+        type=float,
+        default=40.0,
+        help="Pre-amplifier gain in dB (default: -40)",
+    )
+
+    parser.add_argument(
+        "--sample-frequency",
+        type=float,
+        default=16.0,
+        help="Sampling frequency in kHz (default: 16)",
+    )
+
+    parser.add_argument(
+        "--step-interval",
+        type=float,
+        default=0.2,
+        help="Step interval in seconds (default: 0.2)",
+    )
+
+    parser.add_argument(
+        "--simulation-steps",
+        type=int,
+        default=300,
+        help="Number of simulation steps (default: 300)",
+    )
+
+    parser.add_argument(
+        "--env-att",
+        type=float,
+        default=0,
+        help="Glocabal db attenuation of enviroment noise (default: 0)",
+    )
+
+    parser.add_argument(
+        "--load",
+        action="store_true",
+        help="Load previolsy computed info",
+    )
+
+    parser.add_argument(
+        "--force_override",
+        action="store_true",
+        help="Override wav files if they exists",
+    )
+
+    parser.add_argument(
+        "--sample-index",
+        type=str,
+        default=None,
+        help="Accepts single value, ranges and compositions (e.g. 3, 1-5, 1/3-6/10)",
+    )
+
+    parser.add_argument(
+        "--limits",
+        action="store_true",
+        help="Compute global operational limits (distance and speed) without audio synthesis",
+    )
+
+    parser.add_argument(
+        "--first_need_samples",
+        action="store_true",
+        help="Sample for the fixed channels with fixed_distance",
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        default="/data/iemanja",
+        help="Directory to save results (default: /data/iemanja)",
+    )
+
+    args = parser.parse_args()
+    output_dir = args.output_dir
+
+    indexes = None
+
+    if args.first_need_samples:
+
+        df = ml_db.Iemanja.load_df(output_dir)
+
+        mask = (
+            (df["DYNAMIC_TYPE"] == str(syndb.DynamicType.FIXED_DISTANCE).lower()) &
+            ((df.index % 4) < 2)
+        )
+
+        indexes = df.loc[mask, "CATALOG_ID"].tolist()
+
+    if args.sample_index is not None and indexes is None:
+
+        indexes = lps_utils.parse_indices(args.sample_index)
+
+        if not indexes:
+            raise ValueError("Invalid --sample-index format")
+
+
+    if args.load:
+        dataset = syndb.Database.load(output_dir)
+
+    else:
+        dataset = syndb.IEMANJA(
+            n_ships_conditions=args.n_samples,
+            seed=args.seed,
+            n_fixed_scenarios = args.n_fixed_scenarios,
+            n_random_scenarios = args.n_random_scenarios,
+            only_fixed_dynamics = args.only_fixed_dynamics,
+        )
+        dataset.export(output_dir=output_dir)
+
+    if args.only_info:
+        print("############## Dataset ###############")
+        print(dataset.to_df())
+        print("############## Ship Catalog ###############")
+        print(dataset.ship_catalog.to_df())
+        print("############## Acoustic Scenario ###############")
+        print(dataset.acoutic_scenario_catalog.to_df())
+
+    elif args.limits:
+
+        sonar = lps_sonar.Sonar.hydrophone(
+            sensitivity=lps_qty.Sensitivity.db_v_p_upa(args.sensitivity),
+            signal_conditioner = lps_sonar.IdealAmplifier(args.gain)
+        )
+
+        sample_frequency = lps_qty.Frequency.khz(args.sample_frequency)
+        step_interval = lps_qty.Time.s(args.step_interval)
+
+        dataset.compute_limits(
+            sonar=sonar,
+            step_interval=step_interval,
+            simulation_steps=args.simulation_steps,
+            valid_indexes=indexes
+        )
+
+    else:
+        wav_dir = os.path.join(output_dir, "data")
+
+        sonar = lps_sonar.Sonar.hydrophone(
+            sensitivity = lps_qty.Sensitivity.db_v_p_upa(args.sensitivity),
+            signal_conditioner = lps_sonar.IdealAmplifier(args.gain)
+        )
+        sample_frequency = lps_qty.Frequency.khz(args.sample_frequency)
+        step_interval = lps_qty.Time.s(args.step_interval)
+        simulation_steps = args.simulation_steps
+
+        if indexes is not None:
+
+            for idx in tqdm.tqdm(indexes, desc="Making samples", leave=False, ncols=120):
+                dataset.synthesize_sample(
+                    sample_index=idx,
+                    output_dir=wav_dir,
+                    sonar=sonar,
+                    sample_frequency=sample_frequency,
+                    step_interval=step_interval,
+                    simulation_steps=simulation_steps,
+                    global_attenuation_db=args.env_att,
+                    only_plot=args.only_plot,
+                    force_override=args.force_override
+                )
+                # lps_sp_debug.AudioDebugger.save(output_dir=wav_dir)
+        else:
+            dataset.synthesize(
+                output_dir=wav_dir,
+                sonar=sonar,
+                sample_frequency=sample_frequency,
+                step_interval=step_interval,
+                simulation_steps=simulation_steps,
+                global_attenuation_db=args.env_att,
+                only_plot=args.only_plot,
+                force_override=args.force_override
+            )
+
+
+
+@memory_profiler.profile
+def _run():
+    _main()
+
+if __name__ == "__main__":
+    _run()

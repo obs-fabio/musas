@@ -1,0 +1,368 @@
+"""
+Collection Module
+
+Define Collections and their generation process.
+"""
+import os
+import typing
+import random
+import copy
+import tqdm
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import scipy.io.wavfile as sci_wave
+import scipy.signal as sci_sig
+
+import lps_utils.quantities as lps_qty
+import lps_sp.signal as lps_sig
+import lps_synthesis.scenario.scenario as lps_scenario
+import lps_synthesis.scenario.sonar as lps_sonar
+import lps_synthesis.environment.acoustic_site as lps_as
+
+import lps_synthesis.database.dynamic as syndb_dynamic
+import lps_synthesis.database.scenario as syndb_scenario
+import lps_synthesis.database.ship as syndb_ship
+
+import lps_synthesis.database.catalog as syndb_core
+
+class DatabaseEntry(syndb_core.CatalogEntry):
+    """Represents a single entry in a catalog linking
+        a ship, a scenario, and a dynamic configuration."""
+
+    def __init__(self,
+                 ship_id: int,
+                 scenario_id: int,
+                 dynamic_id: int):
+        self.ship_id = ship_id
+        self.scenario_id = scenario_id
+        self.dynamic_id = dynamic_id
+
+    def __str__(self):
+        return f"[{self.ship_id}] {self.scenario_id} | {self.dynamic_id}"
+
+    def as_dict(self) -> dict[str, typing.Any]:
+        """ Converts the entry into a dictionary suitable for tabular representation. """
+        return {
+                "SHIP_CATALOG_ID": self.ship_id,
+                "DYNAMIC_CATALOG_ID": self.dynamic_id,
+                "SCENARIO_CATALOG_ID": self.scenario_id,
+            }
+
+    @staticmethod
+    def load_entries(filename: str) -> typing.List["DatabaseEntry"]:
+        df = pd.read_csv(filename)
+        entries = []
+
+        for _, row in df.iterrows():
+            entries.append(
+                DatabaseEntry(
+                    ship_id=int(row["SHIP_CATALOG_ID"]),
+                    dynamic_id=int(row["DYNAMIC_CATALOG_ID"]),
+                    scenario_id=int(row["SCENARIO_CATALOG_ID"]),
+                )
+            )
+
+        return entries
+
+class Database(syndb_core.Catalog[DatabaseEntry]):
+    """Defines a dataset catalog that links ships, scenarios, and dynamics."""
+
+    def __init__(self,
+                 ship_catalog: syndb_ship.ShipCatalog,
+                 acoutic_scenario_catalog: syndb_core.Catalog[syndb_scenario.AcousticScenario],
+                 n_fixed_scenarios: int,
+                 n_random_scenarios: int,
+                 only_fixed: bool = False,
+                 seed: int = 42):
+
+        rng = random.Random(seed)
+        entries = []
+
+        n_ships = len(ship_catalog)
+        n_scenarios = len(acoutic_scenario_catalog)
+
+        dynamic_catalog = syndb_dynamic.SimulationDynamic.rand_catalog(n_samples=n_ships, seed=seed, only_fixed=only_fixed)
+
+        def _find_n_scenarios(n_samples: int, forbidden_ids: typing.List[int] = []) -> \
+                typing.List[int]:
+            scenarios = []
+            locations = []
+            for _ in range(n_samples):
+
+                while True:
+                    scenario_id = rng.randrange(n_scenarios)
+
+                    s = acoutic_scenario_catalog[scenario_id]
+
+                    if s.local not in locations and scenario_id not in forbidden_ids:
+                        locations.append(s.local)
+                        scenarios.append(scenario_id)
+                        break
+
+            return scenarios
+
+        fixed_scenarios = _find_n_scenarios(n_fixed_scenarios)
+
+        for ship_id in range(n_ships):
+
+            random_scenarios = _find_n_scenarios(n_random_scenarios, fixed_scenarios)
+
+            for scenario_id in fixed_scenarios + random_scenarios:
+
+                entries.append(
+                    DatabaseEntry(
+                        ship_id=ship_id,
+                        scenario_id=scenario_id,
+                        dynamic_id=ship_id
+                    )
+                )
+
+        super().__init__(entries=entries)
+        self.ship_catalog = ship_catalog
+        self.acoutic_scenario_catalog = acoutic_scenario_catalog
+        self.dynamic_catalog = dynamic_catalog
+
+    def export(self, output_dir: str) -> None:
+        """ Exports the catalog and associated tables to CSV files. """
+        os.makedirs(output_dir, exist_ok=True)
+
+        df = self.to_df()
+        df.to_csv(os.path.join(output_dir, "database.csv"), index=False, encoding="utf-8")
+
+        df = self.ship_catalog.to_df()
+        df.to_csv(os.path.join(output_dir, "ship_catalog.csv"), index=False, encoding="utf-8")
+
+        df = self.acoutic_scenario_catalog.to_df()
+        df.to_csv(os.path.join(output_dir, "acoutic_scenario_catalog.csv"),
+                  index=False,
+                  encoding="utf-8")
+
+        df = self.dynamic_catalog.to_df()
+        df.to_csv(os.path.join(output_dir, "dynamic_catalog.csv"), index=False, encoding="utf-8")
+
+
+    @classmethod
+    def load(cls, output_dir: str) -> "Database":
+
+        ship_catalog = syndb_ship.ShipCatalog.load(
+            os.path.join(output_dir, "ship_catalog.csv")
+        )
+
+        scenario_catalog = syndb_scenario.AcousticScenario.load_catalog(
+            os.path.join(output_dir, "acoutic_scenario_catalog.csv")
+        )
+
+        dynamic_catalog = syndb_dynamic.SimulationDynamic.load_catalog(
+            os.path.join(output_dir, "dynamic_catalog.csv")
+        )
+
+        entries = DatabaseEntry.load_entries(os.path.join(output_dir, "database.csv"))
+
+        db = cls.__new__(cls)
+        super(Database, db).__init__(entries=entries)
+
+        db.ship_catalog = ship_catalog
+        db.acoutic_scenario_catalog = scenario_catalog
+        db.dynamic_catalog = dynamic_catalog
+
+        return db
+
+    def synthesize(self,
+                   output_dir: str,
+                   sonar: lps_sonar.Sonar,
+                   sample_frequency: lps_qty.Frequency,
+                   step_interval: lps_qty.Time,
+                   simulation_steps: int,
+                   global_attenuation_db: float,
+                   only_plot: bool = False,
+                   force_override: bool = False) -> None:
+
+        for i in tqdm.tqdm(range(len(self)), desc="Synthesizing", leave=False, ncols=120):
+            self.synthesize_sample(
+                sample_index=i,
+                output_dir=output_dir,
+                sonar=sonar,
+                sample_frequency=sample_frequency,
+                step_interval=step_interval,
+                simulation_steps=simulation_steps,
+                global_attenuation_db=global_attenuation_db,
+                only_plot = only_plot,
+                force_override = force_override
+            )
+
+    def synthesize_sample(self,
+                   sample_index: int,
+                   output_dir: str,
+                   sonar: lps_sonar.Sonar,
+                   sample_frequency: lps_qty.Frequency,
+                   step_interval: lps_qty.Time,
+                   simulation_steps: int,
+                   global_attenuation_db: float,
+                   only_plot: bool,
+                   force_override: bool) -> None:
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        filename = os.path.join(output_dir, f"{sample_index}.wav")
+        dynamic_geo_spec = os.path.join(output_dir, f"{sample_index}_spec.png")
+        dynamic_geo_file = os.path.join(output_dir, f"{sample_index}_geo.png")
+        dynamic_dist_file = os.path.join(output_dir, f"{sample_index}_dist.png")
+
+        if os.path.exists(filename) and not force_override:
+            return
+
+        entry = self[sample_index]
+        acoustic_scenario = self.acoutic_scenario_catalog[entry.scenario_id]
+        ship_info = self.ship_catalog[entry.ship_id]
+        dynamic = self.dynamic_catalog[entry.dynamic_id]
+
+        channel = acoustic_scenario.get_channel()
+        environment = acoustic_scenario.get_env()
+        environment.global_attenuation_db = global_attenuation_db
+
+        desired_simulation_steps = simulation_steps
+        simulation_steps = simulation_steps + 3
+
+        scenario = lps_scenario.Scenario(
+            step_interval=step_interval,
+            channel = channel,
+            environment = None#environment
+        )
+
+        sonar_i = copy.deepcopy(sonar)
+
+        scenario.add_sonar("main", sonar_i)
+
+        ship = ship_info.make_ship(
+            dynamic=dynamic,
+            step_interval=step_interval,
+            simulation_steps=simulation_steps
+        )
+
+        scenario.add_noise_container(ship)
+
+        sonar_i.reset(dynamic.get_sonar_initial_state(ship))
+
+        scenario.simulate(simulation_steps)
+
+        scenario.geographic_plot(dynamic_geo_file)
+        scenario.relative_distance_plot(dynamic_dist_file)
+
+        if not only_plot:
+
+            signal = scenario.get_sonar_audio("main", fs=sample_frequency)
+
+            final_n_samples = int((desired_simulation_steps * step_interval) * sample_frequency)
+
+            center = len(signal) // 2
+            half = final_n_samples // 2
+            signal = signal[center - half : center + half]
+
+            lps_sig.save_wav(signal, sample_frequency, filename)
+
+            float_signal = signal.astype(np.float32) / (2**15 -1)
+            f, t, s = sci_sig.spectrogram(float_signal[:,0],
+                                            fs=sample_frequency.get_hz(),
+                                            nperseg=2048)
+
+            plt.figure(figsize=(10, 6))
+            plt.pcolormesh(t, f, 20 * np.log10(np.clip(s, 1e-10, None)), shading='gouraud')
+            plt.ylabel('Frequência [Hz]')
+            plt.xlabel('Tempo [s]')
+            plt.colorbar(label='Intensidade [dB]')
+            plt.savefig(dynamic_geo_spec)
+            plt.close()
+
+    def compute_limits(self,
+                    sonar: lps_sonar.Sonar,
+                    step_interval: lps_qty.Time,
+                    simulation_steps: int,
+                    valid_indexes: typing.List[int]) -> None:
+
+        global_min_dist = float("inf")
+        global_max_dist = 0.0
+        global_min_speed = float("inf")
+        global_max_speed = 0.0
+        global_min_depth = float("inf")
+        global_max_depth = 0.0
+
+        for i in tqdm.tqdm(range(len(self)), desc="Computing limits", ncols=120):
+
+            if valid_indexes is not None and i not in valid_indexes:
+                continue
+
+            entry = self[i]
+            ship_info = self.ship_catalog[entry.ship_id]
+            dynamic = self.dynamic_catalog[entry.dynamic_id]
+
+            scenario = lps_scenario.Scenario(
+                step_interval=step_interval,
+                channel=None,
+                environment=None
+            )
+
+            sonar_i = copy.deepcopy(sonar)
+            scenario.add_sonar("main", sonar_i)
+
+            ship = ship_info.make_ship(
+                dynamic=dynamic,
+                step_interval=step_interval,
+                simulation_steps=simulation_steps
+            )
+
+            scenario.add_noise_container(ship)
+
+            sonar_i.reset(dynamic.get_sonar_initial_state(ship))
+
+            scenario.simulate(simulation_steps)
+
+            distances = np.array([dist.get_km() for dist in scenario.get_distance_history("main")])
+            speeds = np.array([speed.get_kt() for speed in scenario.get_speed_history()])
+
+            local_min_dist = np.min(distances)
+            local_max_dist = np.max(distances)
+            local_min_speed = np.min(speeds)
+            local_max_speed = np.max(speeds)
+
+            global_min_dist = min(global_min_dist, local_min_dist)
+            global_max_dist = max(global_max_dist, local_max_dist)
+            global_min_speed = min(global_min_speed, local_min_speed)
+            global_max_speed = max(global_max_speed, local_max_speed)
+            global_min_depth = min(global_min_depth, ship.get_depth().get_m())
+            global_max_depth = max(global_max_depth, ship.get_depth().get_m())
+
+        print("\n========== GLOBAL LIMITS ==========")
+        print(f"Distance  : {global_min_dist:.2f} km  ->  {global_max_dist:.2f} km")
+        print(f"Speed     : {global_min_speed:.2f} m/s -> {global_max_speed:.2f} m/s")
+        print(f"Depth     : {global_min_depth:.2f} m -> {global_max_depth:.2f} m")
+        print("====================================\n")
+
+class IEMANJA(Database):
+    """Comprehensive simulated catalog inspired by the OLOCUM dataset."""
+
+    def __init__(self,
+                 n_ships_conditions = 50,
+                 n_fixed_scenarios = 2,
+                 n_random_scenarios = 2,
+                 only_fixed_dynamics: bool = False,
+                 seed: int = 42):
+
+        scenarios = [
+            syndb_scenario.AcousticScenario(local, season)
+            for local in syndb_scenario.Location
+            for season in lps_as.Season
+        ]
+
+        acoutic_scenario_catalog = \
+                syndb_core.Catalog[syndb_scenario.AcousticScenario](entries=scenarios)
+
+        super().__init__(
+            ship_catalog=syndb_ship.ShipCatalog(n_samples=n_ships_conditions, seed=seed),
+            acoutic_scenario_catalog=acoutic_scenario_catalog,
+            n_fixed_scenarios = n_fixed_scenarios,
+            n_random_scenarios = n_random_scenarios,
+            seed=seed,
+            only_fixed=only_fixed_dynamics
+        )

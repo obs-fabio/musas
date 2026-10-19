@@ -1,0 +1,4 @@
+git@github.com:labsonar/utils.git
+git@github.com:labsonar/signal_processing.git
+git@github.com:labsonar/ml.git
+git@github.com:labsonar/acoustic_synthesis.git
